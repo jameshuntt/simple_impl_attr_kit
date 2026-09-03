@@ -1,0 +1,18 @@
+[package]
+name = "simple_impl_attr_kit"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "The key-value attribute grammar for derive macros: every literal, lists, nested keys, repeated keys, a schema with defaults, one-of, requires and conflicts, and errors that point at the key."
+authors = ["James Hunt <james@1o.business>"]
+repository = "https://github.com/jameshuntt/simple_impl_attr_kit"
+readme = "README.md"
+keywords = ["proc-macro", "attributes", "derive", "syn", "parsing"]
+categories = ["development-tools::procedural-macro-helpers", "parsing"]
+include = ["src/**", "tests/**", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
