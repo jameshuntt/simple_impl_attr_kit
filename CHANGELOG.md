@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.3 (2026-10-15)
+
+values can be code now. the bag keeps every `key = ...` value's tokens exactly as written, spans and all, so a derive that emits a value as code puts the compiler's errors where the user wrote it. and a value that is code reads whole up to the next key instead of stopping after its first token. nothing that read before reads differently: the 189,188-case attribute parity run is byte for byte the same as 0.2.2.
+
+### the bag keeps what was written
+
+- the bag only kept the value, so anything read as tokens came back as a string and lost where it was written: [src/bag.rs L368-L428](https://github.com/jameshuntt/simple_impl_attr_kit/blob/abfca64a8cc48bdb8cc317e6eab82376415d1bbd/src/bag.rs#L368-L428). now there's a `written` map next to the entries and `written_tokens(key)` hands the tokens back with their spans, the first `key = ...` for a key written twice: [src/bag.rs L45-L45](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/bag.rs#L45-L45), [src/bag.rs L159-L173](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/bag.rs#L159-L173).
+- parse_entries steps a copy of the input over the same tokens the value was read from and keeps them. a value that ends inside a macro_rules invisible group never lines up, so it just isn't kept instead of failing the parse: [src/bag.rs L353-L378](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/bag.rs#L353-L378). proof: [tests/collect.rs L125-L140](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/tests/collect.rs#L125-L140).
+- merge carries them over: [src/bag.rs L108-L110](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/bag.rs#L108-L110). validate carries them to the key they end up under, so an alias's tokens follow it: [src/schema.rs L223-L228](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/schema.rs#L223-L228), [src/schema.rs L333-L338](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/schema.rs#L333-L338). proof: [tests/collect.rs L75-L97](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/tests/collect.rs#L75-L97).
+
+### code reads whole
+
+- a value that started with a literal took the literal and stopped, and one that started with `[` took the list and stopped, so `2 * self.n` and `[0u8; 4]` failed with "expected `,`": [src/bag.rs L388-L405](https://github.com/jameshuntt/simple_impl_attr_kit/blob/abfca64a8cc48bdb8cc317e6eab82376415d1bbd/src/bag.rs#L388-L405). now the literal or list is only taken when it's the whole value; otherwise it reads as tokens: [src/bag.rs L413-L460](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/bag.rs#L413-L460).
+- the tokens path counted every `<` as an opening angle bracket, so a comparison or a shift (`self.a < self.b`, `self.n << 1`) never closed and swallowed every key after it: [src/bag.rs L407-L427](https://github.com/jameshuntt/simple_impl_attr_kit/blob/abfca64a8cc48bdb8cc317e6eab82376415d1bbd/src/bag.rs#L407-L427). commas inside `<...>` still belong to the value (`HashMap<K, V>`), but when a `<` never closes the value is the expression that ends at the next comma: [src/bag.rs L477-L511](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/src/bag.rs#L477-L511). proof: [tests/collect.rs L99-L122](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/tests/collect.rs#L99-L122).
+
+### Cargo.toml
+
+- version 0.2.2 to 0.2.3: [Cargo.toml L3-L3](https://github.com/jameshuntt/simple_impl_attr_kit/blob/894a273fb9c2732e16012fcce79341dbf93ecd0f/Cargo.toml#L3-L3).
+
 ## 0.2.2 (2026-10-15)
 
 AttrSchema::validate and the validation attr parsers used to return on the first problem they hit, so a bad attribute only ever showed you one error. Now they collect: every check pushes into a SynBuffer from liaise_proc_macro, and it hard fails once at the end with everything it found. A typo the did-you-mean already caught isn't reported a second time as a missing key or a broken requires. Also added CI that tests on stable and 1.85 and publishes to crates.io from main.
