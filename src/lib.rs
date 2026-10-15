@@ -77,7 +77,10 @@ pub use doc::extract_doc_comments;
 pub use error::spanned_error;
 pub use schema::{AttrExpected, AttrSchema};
 pub use type_read::{generic_inner_ty, is_bool_ty, is_option_ty, is_os_string_ty, is_string_ty, is_vec_ty, type_last_ident};
-pub use validation::{parse_field_validation_attrs, parse_validation_attrs, ParsedValidationRule, ParsedValidationSpec};
+pub use validation::{
+    parse_field_validation_attrs, parse_field_validation_attrs_into, parse_validation_attrs, parse_validation_attrs_into, ParsedValidationRule,
+    ParsedValidationSpec,
+};
 pub use value::AttrValue;
 
 #[cfg(doctest)]

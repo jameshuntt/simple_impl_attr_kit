@@ -5,6 +5,7 @@
 //! attributes into small grammar objects that `simple_impl_core` can lower into
 //! `ValidationRule`.
 
+use liaise_proc_macro::SynBuffer;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Attribute, LitStr, Token};
@@ -104,24 +105,35 @@ impl ParsedValidationSpec {
 /// #[one_of("json", "yaml")]
 /// #[at_least_one_of("source", "destination")]
 /// ```
+///
+/// Every attribute is read; all the problems come back together.
 pub fn parse_validation_attrs(attrs: &[Attribute]) -> syn::Result<ParsedValidationSpec> {
+    let mut errs = SynBuffer::new();
+    let spec = parse_validation_attrs_into(attrs, &mut errs);
+    errs.finish_with(spec)
+}
+
+/// [`parse_validation_attrs`] for a caller that collects: each attribute that
+/// cannot be read is reported into `errs`, and the rules that were read are
+/// returned, so they can still be checked.
+pub fn parse_validation_attrs_into(attrs: &[Attribute], errs: &mut SynBuffer) -> ParsedValidationSpec {
     let mut spec = ParsedValidationSpec::new();
 
     for attr in attrs {
         if attr.path().is_ident("validate") {
-            parse_validate_attr(attr, &mut spec)?;
+            errs.absorb(parse_validate_attr(attr, &mut spec));
         } else if attr.path().is_ident("one_of") {
-            spec.push(ParsedValidationRule::OneOf {
-                fields: parse_lit_str_list(attr)?,
-            });
+            if let Some(fields) = errs.absorb(parse_lit_str_list(attr)) {
+                spec.push(ParsedValidationRule::OneOf { fields });
+            }
         } else if attr.path().is_ident("at_least_one_of") {
-            spec.push(ParsedValidationRule::AtLeastOneOf {
-                fields: parse_lit_str_list(attr)?,
-            });
+            if let Some(fields) = errs.absorb(parse_lit_str_list(attr)) {
+                spec.push(ParsedValidationRule::AtLeastOneOf { fields });
+            }
         }
     }
 
-    Ok(spec)
+    spec
 }
 
 /// Parse validation attrs that are valid on an individual field.
@@ -140,34 +152,40 @@ pub fn parse_field_validation_attrs(
     field_name: impl Into<String>,
     attrs: &[Attribute],
 ) -> syn::Result<ParsedValidationSpec> {
+    let mut errs = SynBuffer::new();
+    let spec = parse_field_validation_attrs_into(field_name, attrs, &mut errs);
+    errs.finish_with(spec)
+}
+
+/// [`parse_field_validation_attrs`] for a caller that collects: each
+/// attribute that cannot be read is reported into `errs`, and the rules that
+/// were read are returned.
+pub fn parse_field_validation_attrs_into(
+    field_name: impl Into<String>,
+    attrs: &[Attribute],
+    errs: &mut SynBuffer,
+) -> ParsedValidationSpec {
     let field_name = field_name.into();
-    let mut spec = parse_validation_attrs(attrs)?;
+    let mut spec = parse_validation_attrs_into(attrs, errs);
 
     for attr in attrs {
-        if attr.path().is_ident("requires") {
-            spec.push(ParsedValidationRule::Requires {
-                field: field_name.clone(),
-                required: parse_single_lit_str(attr)?,
-            });
+        let rule = if attr.path().is_ident("requires") {
+            errs.absorb(parse_single_lit_str(attr)).map(|required| ParsedValidationRule::Requires { field: field_name.clone(), required })
         } else if attr.path().is_ident("invalid_without") {
-            spec.push(ParsedValidationRule::InvalidWithout {
-                field: field_name.clone(),
-                required: parse_single_lit_str(attr)?,
-            });
+            errs.absorb(parse_single_lit_str(attr)).map(|required| ParsedValidationRule::InvalidWithout { field: field_name.clone(), required })
         } else if attr.path().is_ident("only_pair_with") {
-            spec.push(ParsedValidationRule::OnlyPairWith {
-                field: field_name.clone(),
-                paired_with: parse_single_lit_str(attr)?,
-            });
+            errs.absorb(parse_single_lit_str(attr)).map(|paired_with| ParsedValidationRule::OnlyPairWith { field: field_name.clone(), paired_with })
         } else if attr.path().is_ident("conflicts_with") {
-            spec.push(ParsedValidationRule::ConflictsWith {
-                field: field_name.clone(),
-                conflicts_with: parse_single_lit_str(attr)?,
-            });
+            errs.absorb(parse_single_lit_str(attr)).map(|conflicts_with| ParsedValidationRule::ConflictsWith { field: field_name.clone(), conflicts_with })
+        } else {
+            None
+        };
+        if let Some(rule) = rule {
+            spec.push(rule);
         }
     }
 
-    Ok(spec)
+    spec
 }
 
 fn parse_validate_attr(attr: &Attribute, spec: &mut ParsedValidationSpec) -> syn::Result<()> {

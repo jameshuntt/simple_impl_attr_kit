@@ -1,5 +1,6 @@
 //! What an attribute may say: the keys, their kinds, and the rules between them.
 
+use liaise_proc_macro::SynBuffer;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{AttrBag, AttrValue};
@@ -212,8 +213,10 @@ impl AttrSchema {
 
     /// Check `parsed` against the rules and return the validated bag: aliases
     /// resolved, defaults filled, repeatable keys as lists. Errors point at
-    /// the key they are about.
+    /// the key they are about. Every key is checked; all problems come back
+    /// together as one error.
     pub fn validate(&self, parsed: &AttrBag) -> syn::Result<AttrBag> {
+        let mut errs = SynBuffer::new();
         // resolve aliases into a working copy
         let mut working = AttrBag::new();
         let mut spans: BTreeMap<String, proc_macro2::Span> = BTreeMap::new();
@@ -221,13 +224,17 @@ impl AttrSchema {
             let name = self.aliases.get(key).cloned().unwrap_or_else(|| key.clone());
             let span = parsed.span_of(key).unwrap_or_else(|| parsed.attr_span());
             if working.contains_key(&name) {
-                return Err(syn::Error::new(span, format!("`{key}` and `{name}` are the same key; give it once")));
+                errs.push(syn::Error::new(span, format!("`{key}` and `{name}` are the same key; give it once")));
+                continue;
             }
             working.insert(name.clone(), value.clone());
             spans.insert(name, span);
         }
         let span_of = |key: &str| spans.get(key).copied().unwrap_or_else(|| parsed.attr_span());
 
+        // keys an unknown key was probably meant to be: a missing required one
+        // among them is the same typo, already reported, so it is not again
+        let mut suggested: BTreeSet<String> = BTreeSet::new();
         if !self.allow_unknown {
             let known: BTreeSet<&String> = self.fields.keys().collect();
             for key in working.keys() {
@@ -235,10 +242,11 @@ impl AttrSchema {
                     let mut msg = format!("unknown attribute key `{key}`");
                     if let Some(near) = closest(key, self.fields.keys()) {
                         msg.push_str(&format!("; did you mean `{near}`?"));
+                        suggested.insert(near.clone());
                     }
                     let list: Vec<&str> = self.fields.keys().map(String::as_str).collect();
                     msg.push_str(&format!(" known keys: {}", list.join(", ")));
-                    return Err(syn::Error::new(span_of(key), msg));
+                    errs.push(syn::Error::new(span_of(key), msg));
                 }
             }
         }
@@ -252,38 +260,41 @@ impl AttrSchema {
                         AttrValue::List(items) => items.clone(),
                         single => vec![single.clone()],
                     };
-                    for item in &items {
-                        if !rule.expected.matches(item) {
-                            return Err(syn::Error::new(
-                                span_of(name),
-                                format!("expected {} for each `{name}`, got {}", rule.expected.name(), item.kind_name()),
-                            ));
-                        }
+                    let bad = items.iter().find(|item| !rule.expected.matches(item));
+                    if let Some(item) = bad {
+                        errs.push(syn::Error::new(
+                            span_of(name),
+                            format!("expected {} for each `{name}`, got {}", rule.expected.name(), item.kind_name()),
+                        ));
+                        continue;
                     }
                     result.insert_spanned(name.clone(), AttrValue::List(items), span_of(name));
                 }
                 Some(AttrValue::List(items)) if parsed.was_repeated(name) => {
-                    return Err(syn::Error::new(span_of(name), format!("`{name}` given {} times; expected once", items.len())));
+                    errs.push(syn::Error::new(span_of(name), format!("`{name}` given {} times; expected once", items.len())));
                 }
                 Some(value) if rule.expected.matches(value) => {
                     if let (Some(choices), Some(s)) = (&rule.one_of, value.as_str()) {
                         if !choices.iter().any(|c| c == s) {
-                            return Err(syn::Error::new(
+                            errs.push(syn::Error::new(
                                 span_of(name),
                                 format!("`{name}` must be one of {}, not \"{s}\"", choices.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")),
                             ));
+                            continue;
                         }
                     }
                     result.insert_spanned(name.clone(), value.clone(), span_of(name));
                 }
                 Some(value) => {
-                    return Err(syn::Error::new(
+                    errs.push(syn::Error::new(
                         span_of(name),
                         format!("expected {} for `{name}`, got {}", rule.expected.name(), value.kind_name()),
                     ));
                 }
                 None if rule.required => {
-                    return Err(syn::Error::new(parsed.attr_span(), format!("missing required attribute key `{name}`")));
+                    if !suggested.contains(name) {
+                        errs.push(syn::Error::new(parsed.attr_span(), format!("missing required attribute key `{name}`")));
+                    }
                 }
                 None if rule.repeatable => {
                     result.insert_spanned(name.clone(), AttrValue::List(Vec::new()), parsed.attr_span());
@@ -297,13 +308,14 @@ impl AttrSchema {
         }
 
         for (key, other) in &self.requires {
-            if working.contains_key(key) && !working.contains_key(other) {
-                return Err(syn::Error::new(span_of(key), format!("`{key}` requires `{other}`")));
+            // a key that is only misspelt is reported once, as unknown
+            if working.contains_key(key) && !working.contains_key(other) && !suggested.contains(other) {
+                errs.push(syn::Error::new(span_of(key), format!("`{key}` requires `{other}`")));
             }
         }
         for (key, other) in &self.conflicts {
             if working.contains_key(key) && working.contains_key(other) {
-                return Err(syn::Error::new(span_of(key), format!("`{key}` cannot be used with `{other}`")));
+                errs.push(syn::Error::new(span_of(key), format!("`{key}` cannot be used with `{other}`")));
             }
         }
 
@@ -314,7 +326,7 @@ impl AttrSchema {
                 }
             }
         }
-        Ok(result)
+        errs.finish_with(result)
     }
 }
 
