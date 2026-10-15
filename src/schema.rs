@@ -220,8 +220,12 @@ impl AttrSchema {
         // resolve aliases into a working copy
         let mut working = AttrBag::new();
         let mut spans: BTreeMap<String, proc_macro2::Span> = BTreeMap::new();
+        let mut written: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
         for (key, value) in parsed.entries() {
             let name = self.aliases.get(key).cloned().unwrap_or_else(|| key.clone());
+            if let Some(tokens) = parsed.written_tokens(key) {
+                written.entry(name.clone()).or_insert_with(|| tokens.clone());
+            }
             let span = parsed.span_of(key).unwrap_or_else(|| parsed.attr_span());
             if working.contains_key(&name) {
                 errs.push(syn::Error::new(span, format!("`{key}` and `{name}` are the same key; give it once")));
@@ -324,6 +328,12 @@ impl AttrSchema {
                 if !result.contains_key(key) {
                     result.insert_spanned(key.clone(), value.clone(), span_of(key));
                 }
+            }
+        }
+        // each key that made it into the result keeps its tokens as written
+        for (name, tokens) in written {
+            if result.contains_key(&name) {
+                result.written.insert(name, tokens);
             }
         }
         errs.finish_with(result)

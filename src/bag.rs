@@ -41,6 +41,8 @@ pub struct Entry {
 pub struct AttrBag {
     entries: BTreeMap<String, Entry>,
     attr_span: Option<Span>,
+    /// `key = ...` values exactly as written, tokens and spans, first one per key.
+    pub(crate) written: BTreeMap<String, TokenStream2>,
 }
 
 impl PartialEq for Entry {
@@ -66,12 +68,13 @@ impl AttrBag {
         if !attr.path().is_ident(expected_name) {
             return Err(syn::Error::new_spanned(attr, format!("expected #[{expected_name}(...)] attribute")));
         }
-        let mut bag = Self { entries: BTreeMap::new(), attr_span: Some(attr.span()) };
+        let mut bag = Self { entries: BTreeMap::new(), attr_span: Some(attr.span()), written: BTreeMap::new() };
         match &attr.meta {
             syn::Meta::Path(_) => Ok(bag),
             syn::Meta::List(list) => {
                 let entries = parse_entries.parse2(list.tokens.clone())?;
-                for (key, span, value) in entries {
+                for (key, span, value, written) in entries {
+                    bag.record_written(&key, written);
                     bag.push(key, span, value);
                 }
                 Ok(bag)
@@ -101,6 +104,9 @@ impl AttrBag {
     pub fn merge(&mut self, other: Self, _span_tokens: impl ToTokens) -> syn::Result<()> {
         if self.attr_span.is_none() {
             self.attr_span = other.attr_span;
+        }
+        for (key, written) in other.written {
+            self.written.entry(key).or_insert(written);
         }
         for (key, entry) in other.entries {
             match entry.value {
@@ -148,6 +154,22 @@ impl AttrBag {
     /// The value under `key`.
     pub fn get(&self, key: &str) -> Option<&AttrValue> {
         self.entries.get(key).map(|e| &e.value)
+    }
+
+    /// The value of `key = ...` exactly as it was written: its tokens with
+    /// their spans, whatever kind the value read as. For a key written more
+    /// than once, the first `key = ...`. For a value that is code
+    /// (`arg_expr = self.n + 1`), emitting these puts any error the compiler
+    /// finds in it at the place it was written. `None` for a key written
+    /// without `=`, or not written.
+    pub fn written_tokens(&self, key: &str) -> Option<&TokenStream2> {
+        self.written.get(key)
+    }
+
+    fn record_written(&mut self, key: &str, written: Option<TokenStream2>) {
+        if let Some(tokens) = written {
+            self.written.entry(key.to_owned()).or_insert(tokens);
+        }
     }
 
     /// Where `key` was written, if it was.
@@ -324,13 +346,36 @@ fn existing_was_repeated(entry: &Entry) -> bool {
 }
 
 /// `key`, `key = value`, `key(...)`, comma separated, trailing comma allowed.
-fn parse_entries(input: ParseStream<'_>) -> syn::Result<Vec<(String, Span, AttrValue)>> {
+fn parse_entries(input: ParseStream<'_>) -> syn::Result<Vec<(String, Span, AttrValue, Option<TokenStream2>)>> {
     let mut out = Vec::new();
     while !input.is_empty() {
         let (key, span) = parse_key(input)?;
+        let mut written = None;
         let value = if input.peek(Token![=]) {
             input.parse::<Token![=]>()?;
-            parse_value(input)?
+            // the tokens the value read from, kept with their spans
+            let start = input.fork();
+            let value = parse_value(input)?;
+            // step the copy over the same tokens; a value that ends inside an
+            // invisible group (from a macro_rules expansion) never lines up,
+            // and is then simply not kept
+            let mut tokens = TokenStream2::new();
+            let mut lined_up = true;
+            while start.cursor() != input.cursor() {
+                if start.is_empty() {
+                    lined_up = false;
+                    break;
+                }
+                match start.parse::<TokenTree>() {
+                    Ok(token) => tokens.extend(std::iter::once(token)),
+                    Err(_) => {
+                        lined_up = false;
+                        break;
+                    }
+                }
+            }
+            written = lined_up.then_some(tokens);
+            value
         } else if input.peek(syn::token::Paren) {
             let content;
             syn::parenthesized!(content in input);
@@ -338,7 +383,7 @@ fn parse_entries(input: ParseStream<'_>) -> syn::Result<Vec<(String, Span, AttrV
         } else {
             AttrValue::Bool(true)
         };
-        out.push((key, span, value));
+        out.push((key, span, value, written));
         if input.is_empty() {
             break;
         }
@@ -365,55 +410,83 @@ fn parse_key(input: ParseStream<'_>) -> syn::Result<(String, Span)> {
     Ok((key, span))
 }
 
-/// The value after `=`: a literal (with an optional leading minus), a
-/// bracketed list, or verbatim tokens up to the next top-level comma.
+/// The value after `=`: a literal (with an optional leading minus) or a
+/// bracketed list when that is the whole value, otherwise verbatim tokens up
+/// to the next top-level comma. A literal or list that is only the start of
+/// more (`2 * self.n`, `[0u8; 4]`) is read as tokens. Commas inside `<...>`
+/// belong to the value (`HashMap<K, V>`); when a `<` is never closed (a
+/// comparison or a shift, `self.a < self.b`), the value is the expression
+/// that ends at the next comma instead of the rest of the attribute.
 fn parse_value(input: ParseStream<'_>) -> syn::Result<AttrValue> {
+    use syn::parse::discouraged::Speculative;
+    let whole = |rest: &syn::parse::ParseBuffer<'_>| rest.is_empty() || rest.peek(Token![,]);
     if input.peek(syn::token::Bracket) {
-        let content;
-        syn::bracketed!(content in input);
-        let mut items = Vec::new();
-        while !content.is_empty() {
-            items.push(parse_value(&content)?);
-            if content.is_empty() {
-                break;
+        let fork = input.fork();
+        if let Ok(list) = parse_list(&fork) {
+            if whole(&fork) {
+                input.advance_to(&fork);
+                return Ok(list);
             }
-            content.parse::<Token![,]>()?;
         }
-        return Ok(AttrValue::List(items));
+        return parse_tokens(input);
     }
-    let negative = input.peek(Token![-]) && (input.peek2(syn::LitInt) || input.peek2(syn::LitFloat));
+    let fork = input.fork();
+    let negative = fork.peek(Token![-]) && (fork.peek2(syn::LitInt) || fork.peek2(syn::LitFloat));
     if negative {
-        input.parse::<Token![-]>()?;
+        fork.parse::<Token![-]>()?;
     }
-    if input.peek(Lit) && !input.peek2(Token![.]) && !input.peek2(Token![::]) {
-        let lit: Lit = input.parse()?;
-        let value = match lit {
-            Lit::Str(s) => AttrValue::Str(s.value()),
-            Lit::Bool(b) => AttrValue::Bool(b.value()),
-            Lit::Int(i) => {
-                let v = i.base10_parse::<i64>()?;
-                AttrValue::Int(if negative { -v } else { v })
-            }
-            Lit::Float(f) => {
-                let v = f.base10_parse::<f64>()?;
-                AttrValue::Float(if negative { -v } else { v })
-            }
-            Lit::Char(c) => AttrValue::Char(c.value()),
-            Lit::ByteStr(b) => AttrValue::Bytes(b.value()),
-            other => AttrValue::Tokens(other.to_token_stream().to_string()),
-        };
-        return Ok(value);
+    if fork.peek(Lit) {
+        let lit: Lit = fork.parse()?;
+        if whole(&fork) {
+            input.advance_to(&fork);
+            return Ok(match lit {
+                Lit::Str(s) => AttrValue::Str(s.value()),
+                Lit::Bool(b) => AttrValue::Bool(b.value()),
+                Lit::Int(i) => {
+                    let v = i.base10_parse::<i64>()?;
+                    AttrValue::Int(if negative { -v } else { v })
+                }
+                Lit::Float(f) => {
+                    let v = f.base10_parse::<f64>()?;
+                    AttrValue::Float(if negative { -v } else { v })
+                }
+                Lit::Char(c) => AttrValue::Char(c.value()),
+                Lit::ByteStr(b) => AttrValue::Bytes(b.value()),
+                other => AttrValue::Tokens(other.to_token_stream().to_string()),
+            });
+        }
     }
-    let mut tokens = TokenStream2::new();
-    if negative {
-        tokens.extend(std::iter::once(TokenTree::Punct(proc_macro2::Punct::new('-', proc_macro2::Spacing::Alone))));
-    }
-    let mut angle_depth = 0usize;
-    while !input.is_empty() {
-        if angle_depth == 0 && input.peek(Token![,]) {
+    parse_tokens(input)
+}
+
+/// `[a, "b", 3]`.
+fn parse_list(input: ParseStream<'_>) -> syn::Result<AttrValue> {
+    let content;
+    syn::bracketed!(content in input);
+    let mut items = Vec::new();
+    while !content.is_empty() {
+        items.push(parse_value(&content)?);
+        if content.is_empty() {
             break;
         }
-        let token = input.parse::<TokenTree>()?;
+        content.parse::<Token![,]>()?;
+    }
+    Ok(AttrValue::List(items))
+}
+
+/// Verbatim tokens up to the next top-level comma, commas inside `<...>`
+/// included; a `<` that is never closed is a comparison or a shift, and then
+/// the value is the expression that ends at the next comma.
+fn parse_tokens(input: ParseStream<'_>) -> syn::Result<AttrValue> {
+    use syn::parse::discouraged::Speculative;
+    let angled = input.fork();
+    let mut tokens = TokenStream2::new();
+    let mut angle_depth = 0usize;
+    while !angled.is_empty() {
+        if angle_depth == 0 && angled.peek(Token![,]) {
+            break;
+        }
+        let token = angled.parse::<TokenTree>()?;
         match &token {
             TokenTree::Punct(p) if p.as_char() == '<' => angle_depth = angle_depth.saturating_add(1),
             TokenTree::Punct(p) if p.as_char() == '>' => angle_depth = angle_depth.saturating_sub(1),
@@ -421,6 +494,16 @@ fn parse_value(input: ParseStream<'_>) -> syn::Result<AttrValue> {
         }
         tokens.extend(std::iter::once(token));
     }
+    if angle_depth > 0 {
+        let expr_fork = input.fork();
+        if let Ok(expr) = expr_fork.parse::<syn::Expr>() {
+            if expr_fork.is_empty() || expr_fork.peek(Token![,]) {
+                input.advance_to(&expr_fork);
+                return Ok(AttrValue::Tokens(expr.to_token_stream().to_string()));
+            }
+        }
+    }
+    input.advance_to(&angled);
     if tokens.is_empty() {
         return Err(input.error("expected a value after `=`"));
     }
@@ -435,8 +518,9 @@ fn parse_group(content: ParseStream<'_>, key: &str, span: Span) -> syn::Result<A
     let nested = looks_like_key(content);
     if nested {
         let entries = parse_entries(content)?;
-        let mut bag = AttrBag { entries: BTreeMap::new(), attr_span: Some(span) };
-        for (k, s, v) in entries {
+        let mut bag = AttrBag { entries: BTreeMap::new(), attr_span: Some(span), written: BTreeMap::new() };
+        for (k, s, v, w) in entries {
+            bag.record_written(&k, w);
             bag.push(k, s, v);
         }
         Ok(AttrValue::Nested(bag))
